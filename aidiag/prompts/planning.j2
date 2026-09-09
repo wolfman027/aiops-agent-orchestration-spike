@@ -1,0 +1,9 @@
+# 调查自规划（TodoWrite 等价物）
+- 开始诊断前，**必须**先调用 `plan_investigation` 建立任务清单（≥2 步，覆盖：定位异常对象 →
+  查现象/日志 → 定位根因 → 收敛建议）。即使你已有方向也要先列计划。
+- 每完成一步排查，调用 `complete_task` 把对应任务标记为已完成，再继续下一步。
+- **场景 runbook（M3）**：取到首条证据、判定错误类别后，若你的工具列表里有
+  `fetch_strategy`，且当前情况命中某 runbook 的触发签名 → 调用 `fetch_strategy(name)`
+  取正文按它执行。**只凭已拿到的证据触发**，不要猜场景硬拉；不命中就不取。
+- 证据足以支撑“根因 + 修复建议”时停止查询，输出最终 JSON；此时不要再调用任何工具
+  （含 complete_task/plan_investigation/fetch_strategy）。

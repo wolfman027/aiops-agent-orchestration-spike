@@ -1,0 +1,28 @@
+# Golden 用例集（v4 §6 反幻觉跑分）
+# - 数据集/env 在代码里单点定义（aidiag.tools.datasources.crashloop_env），本文件只声明
+#   用哪个 fixture + 期望断言。数据集绝不进提示词。
+# - 断言只针对「只能靠查询发现」的唯一值（错误码 token），禁止断言可猜的泛化文案。
+case: crashloop
+env_fixture: crashloop          # -> crashloop_env()
+runs: 2                          # 同用例跑 2 次，验证结论稳定
+issue:
+  id: case-a
+  # 显式 k8s：走旧 mock 数据源（PROFILES["k8s"]=空，不绑 MCP）
+  case_type: k8s
+  title: "[P0] payment/checkout 反复 CrashLoopBackOff，Deployment checkout 无可用副本"
+  description: >-
+    从 2026-09-08T01:15Z 起，checkout 服务的 pod 持续重启并处于 CrashLoopBackOff，
+    Deployment checkout 0/1 可用；支付请求超时。请定位根因并给出修复建议。
+  namespace: payment
+  strategy: crashloop
+expect:
+  # 唯一错误码：只存在于 checkout 容器日志，模型必须查询到并写进结论（反幻觉核心断言）
+  must_contain_in_conclusion:
+    - "payment-checkout-db-conn-timeout-e9f2"
+  # 修复建议非空
+  fix_nonempty: true
+  # 每个 recommended_fix.target 必须落在 checkout 应用/其依赖上（含 checkout 子串），
+  # 不得指向未查证的资源（如健康网关 checkout-gateway 或臆造对象）
+  fix_target_scope: ["checkout"]
+  # 期望至少覆盖两条证据维度：现象 + 根因线索
+  min_evidence: 2

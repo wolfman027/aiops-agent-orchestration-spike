@@ -1,0 +1,23 @@
+# 场景 runbook：失败 trace → 外部依赖连接失败（trace_dependency）
+命中：日志栈出现 connect/socket/pool 超时、connection refused、或 handshake 到某 host 失败。
+这类错误不该当普通代码缺陷处理——先分清**依赖挂了**还是**配置连错了**，target 可离开仓库。
+
+1. **锚定 host:port**：从异常原文提取连接目标（host:port / URL / 连接池名），它决定这条证据
+   指向"哪个依赖"。不要凭输入里的服务名猜，以日志原文为准。
+2. **代码地址 vs 服务发现**：用 git 只读工具（grep/show/blame）查**当前仓库 HEAD** 上该依赖
+   地址是怎么来的：
+   - 是代码里写死 / 配置文件写死？→ 记录该 file:line 与期望值；
+   - 还是走环境变量 / 服务发现（K8s service、DNS、注册中心）？→ 记录 key 名，但值不在仓库里。
+   两种来源决定修复动作完全不同。
+3. **判定：依赖挂 vs 配置错**（用日志时间窗 + 一致性判断，不做探测）：
+   - 连接目标与代码/配置一致、且是合法目标 → 倾向**依赖方本身不健康**：修复动作指向**依赖方**
+     （其资源名/服务名），action 用 `restart`/`scale` 或指向依赖方的描述，target **可离开本仓库**；
+   - 连接目标与代码/配置**不一致 / 端口错 / 连到错误环境** → **配置错**：action=`config_change`，
+     target=配置文件路径或该依赖的配置项，change 写清"从 X 改成 Y"；
+   - 写死的地址已不可达 → 这算仓库缺陷：action=`code_fix`，按兜底 trace_bug 的版本对齐纪律
+     （锚 deployed、比 HEAD、case a/b/c）出 diff，但**先别下"依赖挂了"的结论**——地址都写死了，
+     依赖迁移后代码没跟上也是同症状。
+4. **不要越权探测**：runbook 只做只读诊断；不要声称"已重连/已重启依赖"。recommended_fix 是给人
+   批复的建议，执行方在别处。
+5. **收敛**：拿到"日志原文 host:port + 代码/配置侧来源 + 判定"即可停，输出结论 JSON；证据不足
+   就把 root_cause 写成"证据不足"、confidence 压到 medium/low，不要硬猜依赖是否真的挂。

@@ -1,0 +1,20 @@
+# 场景 runbook：Pod CrashLoopBackOff / 容器反复重启
+当证据显示目标 pod 处于 CrashLoopBackOff、或容器 restart_count 持续上升、就绪失败时：
+
+1. **describe_pod** 拿精确信息：容器名、镜像、restart_count、Last State（terminated 的
+   exit_code / reason / 起止时间）、events（BackOff / 拉镜像失败 / OOMKilled / 探针失败）。
+2. **query_logs** 拉该容器日志。崩溃若发生在启动即退出 → 重点看**启动期**日志（框架初始化、
+   连接池、配置加载），而不是运行期请求日志。
+3. 若启动错误指向**外部依赖连接失败**（DB/Redis/其他服务）：核对日志里的目标 host 与服务
+   发现名是否一致、端口、是否连到错误环境；结合它判断是依赖本身挂了还是配置/网络问题。
+4. 证据收集建议：
+   - exit_code 与 last_state.reason（区分 OOMKilled=137 / 探针失败 / 业务异常=1）
+   - 日志中的异常类、错误码/唯一 token、host:port
+   - 事件里的 BackOff 次数与镜像是否拉取成功
+5. 常见 root cause → 修复动作映射：
+   - 依赖不可达且代码写死/配错 host → `config_change`（改正确依赖地址）+ 必要时先 `restart`
+   - 依赖服务本身不健康 → 修复动作指向**依赖方**，而非本 pod
+   - 配置缺失/错误 → `config_change`
+   - 代码缺陷（如连接池参数导致启动即崩）→ `code_fix`
+   - 资源不足/OOM → `scale`（调资源/副本）
+6. recommended_fix 只给**建议**，不许声称已执行；每个 action 的 target 必须是你查证过的资源。

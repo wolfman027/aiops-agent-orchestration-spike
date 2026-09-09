@@ -1,0 +1,20 @@
+# 场景 runbook：应用启动期失败 / 反复重启 / 初始化即崩（trace_startup）
+命中：应用起不来、反复重启、或初始化阶段即失败——这类失败通常**没有请求级 trace**，主查询原语是
+**app + 时间窗**拉启动期日志，不是 trace_id。这是与 trace_bug/trace_dependency 最明显的区别。
+
+1. **app + 时间窗拉日志**：窗口覆盖最近一次启动，重点看**启动期**输出（框架/上下文初始化、配置加载、
+   连接池创建、迁移脚本），而不是运行期请求日志。无 trace 时用 app + 时间窗原语。
+2. **错误原文定位**：抓初始化异常的第一个完整栈（异常类 + 唯一错误码/token/file:line），它决定后续
+   去 git 找哪段启动代码。
+3. **git 定位启动代码**（只读）：用栈里的 file:line / 类名 / 报错文案在仓库 HEAD 上 grep/blame/show
+   找到启动链路上触发点。比对 deployed vs HEAD：若输入给了线上 commit 就用它锚证据；给不出就明说
+   "部署 sha 未知、无法核对线上/HEAD"，降 confidence。
+4. **归类 → 修复动作**：
+   - 配置缺失 / 加载失败 / 连错环境 → `config_change`（target=配置或配置文件路径）；
+   - 初始化代码缺陷（连接池参数、空指针、顺序错）→ `code_fix`，按 trace_bug 的版本对齐纪律出 diff；
+   - 日志现 `OutOfMemoryError` 等**资源型**栈 → 归本 runbook 子分支处理，但见第 5 条。
+5. **证据弱边界（反幻觉）**：本 runbook 无 k8s 的 exit_code/events，**无法证实进程级崩溃**（SIGKILL/
+   OOMKilled=137 在纯日志里无痕迹）。若症状像资源型（反复重启、无业务异常即死），recommended_fix 里
+   **必须写明"需回 k8s case_type 用 describe_pod/events 佐证"**，并把 confidence 压到 medium 以下——
+   不要凭纯日志断言"内存不足导致崩溃"。
+6. **收敛**：拿到"启动期错误原文 + git 侧触发代码 + 归类"即可停；无法定位根因就明确写证据不足。

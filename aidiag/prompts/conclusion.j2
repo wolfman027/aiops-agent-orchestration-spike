@@ -1,0 +1,50 @@
+# 最终结论 JSON 契约
+只输出一个严格 JSON 对象，形如：
+```json
+{
+  "root_cause": "一句话根因；必须包含你能从工具原文中找到的唯一错误标识（错误码/token/连接目标/file:line），
+                 不要只写泛化结论",
+  "confidence": "high",
+  "summary": "2-4 句诊断过程简述（查了什么、发现什么、如何定位）",
+  "evidence": [
+    {
+      "source": "app_log | git_log | git_blame | git_grep | ... 工具名",
+      "query": "你实际传入的关键参数，如 trace_id / repo+pattern / commit 区间",
+      "finding": "该条证据支持的判断",
+      "supporting_text": "来自工具输出的原文引用（保留唯一错误标识，逐字）",
+      "commit": "可选：这条证据取自哪个 commit（必须是工具返回里出现过的 sha，否则省略）"
+    }
+  ],
+  "recommended_fix": [
+    {
+      "action": "code_fix | config_change | restart | scale | db_action 之一",
+      "target": "infra=资源名；code=文件路径（须与 git 返回的文件路径一致）",
+      "change": "纯文本'怎么改'（code_fix 必填：改哪个文件哪段逻辑、怎么改）",
+      "expected_effect": "执行后预期的效果",
+      "risk": "low | medium | high",
+      "rollback": "如何回滚；无则写 '无'",
+      "suggested_diff": "可选：示意 diff（给人看，无执行语义）；仅 code_fix/config_change 用"
+    }
+  ]
+}
+```
+
+## 版本对齐字段（可选，涉及代码/提交时填写）
+```json
+{
+  "deployed_commit": "证据锚点：日志栈帧对应的线上 sha（工具返回中出现过才写）",
+  "base_commit": "diff 落点：默认 HEAD tip 的 sha（工具返回中出现过才写）",
+  "base_note": "deployed≠base 时写 case a/b/c 判定 + 迁移描述",
+  "already_fixed_by": "非空=该错误已由某 commit 修复，无需新改动；此时 recommended_fix 应为空"
+}
+```
+
+## 约束
+- `evidence[].supporting_text` 与 `root_cause` 里的唯一标识**必须来自工具返回**，禁止编造。
+- `recommended_fix[].target` 只能引用工具返回中出现过的资源（deployment/pod/容器/依赖服务名）
+  或**文件路径**；不得引入你没查证过的资源/文件。
+- **sha 纪律**：plan 里出现的任何 sha（base/deployed/already_fixed_by/evidence.commit）**必须是
+  某次工具返回里出现过的 sha**。你只做选择/引用，绝不拼写或猜测 sha；没有就把字段留空/省略。
+- evidence 至少 2 条：既要有“现象/请求失败原文”，也要有“根因线索”（日志原文或代码/提交证据）。
+- `confidence`：有直接证据原文支撑根因 → high；只有间接线索 → medium；无法定位 → low 且
+  root_cause 明确写“证据不足”。

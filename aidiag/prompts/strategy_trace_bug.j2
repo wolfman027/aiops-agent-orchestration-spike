@@ -1,0 +1,22 @@
+# trace runbook：单条失败 trace → 简单代码缺陷（兜底）
+命中：一条失败请求/异常 trace，有异常签名，不属依赖连接或启动崩溃的特类。这是通用路径，
+不取它也能靠方法论 + 契约出活，只是更泛。
+
+1. **锚定失败点**：确认 trace 中抛异常的位置 —— 记录异常类/错误码/file:line 等唯一标识。
+   它决定“这条证据锚在哪个线上 commit”（deployed）。
+2. **版本关系判定（git 只读工具，先取 repo-state 的 HEAD）**：
+   - 若输入给了 deployed（platform 的 commit，或 image→经 git 只读映射的 sha）用该 sha 当 C_deploy；
+     没有就给不出 → 明说“部署 sha 未知、无法核对线上/HEAD”，走 case a 但降 confidence。
+   - 比对该文件 deployed vs HEAD：
+     - a. 代码没动（文件两边一致）→ 直接以 HEAD 为底出 diff；
+     - b. 错误已在 deployed..HEAD 间被修掉 → `git log -S "<错误签名>" C_deploy..HEAD -- <file>`
+       找到修复 commit → **不写 diff**，填 `already_fixed_by=该 sha`，recommended_fix 留空；
+     - c. 改了但错误仍复现 → 以 HEAD 为底，但**禁用旧 file:line**，用错误签名在 HEAD 上
+       git grep 重搜定位，再出 diff。
+3. **定位根因**：沿异常 file:line 用 git 只读工具（blame/show/log/grep）找到触发代码与引入点。
+   file:line 必须与你实际查到的日志栈帧一致。
+4. **产出 recommended_fix（给人批复，只读，不执行）**：
+   - `action=code_fix`；`target=文件路径`（与 git 返回一致）；`change`=纯文本“怎么改”；
+     `rollback=git revert <base_commit>` 或“撤该改动”；可给 `suggested_diff` 示意。
+   - 凡 plan 里出现的 sha 必须是某次工具输出里见过的；没见过就不填。
+5. **收敛**：证据足以支撑就输出最终 JSON；不再多查。
