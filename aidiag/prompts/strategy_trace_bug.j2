@@ -4,7 +4,8 @@
 
 1. **锚定失败点**：确认 trace 中抛异常的位置 —— 记录异常类/错误码/file:line 等唯一标识。
    它决定“这条证据锚在哪个线上 commit”（deployed）。
-2. **版本关系判定（git 只读工具，先取 repo-state 的 HEAD）**：
+2. **版本关系判定（git 只读工具：先用仓库状态类工具取当前 HEAD）**：
+   - 仓库状态工具需要仓库定位参数时（真 server 的 `repo_path`），用 user 上下文里的 `仓库(repo)` 值。
    - 若输入给了 deployed（platform 的 commit，或 image→经 git 只读映射的 sha）用该 sha 当 C_deploy；
      没有就给不出 → 明说“部署 sha 未知、无法核对线上/HEAD”，走 case a 但降 confidence。
    - 比对该文件 deployed vs HEAD：
@@ -16,7 +17,10 @@
 3. **定位根因**：沿异常 file:line 用 git 只读工具（blame/show/log/grep）找到触发代码与引入点。
    file:line 必须与你实际查到的日志栈帧一致。
 4. **产出 recommended_fix（给人批复，只读，不执行）**：
-   - `action=code_fix`；`target=文件路径`（与 git 返回一致）；`change`=纯文本“怎么改”；
-     `rollback=git revert <base_commit>` 或“撤该改动”；可给 `suggested_diff` 示意。
+   - 每个方案：`title` + `applies_when`（前提）+ `recommended`（恰一个 true）+ `reason`；
+     方案内 `steps[]`：`action=code_fix`；`target=文件路径`（与 git 返回一致）；`change`=纯文本"怎么改"；
+     `rollback=git revert <base_commit>` 或"撤该改动"；可给 `suggested_diff` 示意。
+   - **若根因依赖未定的业务前提**（例：某字段是否必填、边界条件），输出**互斥多方案**，各写
+     `applies_when`，并标一个 `recommended=true`；否则只给**一个**方案。
    - 凡 plan 里出现的 sha 必须是某次工具输出里见过的；没见过就不填。
 5. **收敛**：证据足以支撑就输出最终 JSON；不再多查。

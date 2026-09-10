@@ -46,10 +46,12 @@
                                     查 app-log MCP  (mcp__applog__get_trace …)
                                     判错误类别 → fetch_strategy(name)   ← M3 证据驱动取 runbook
                                     查 git MCP (只读白名单) → repo-state 取 HEAD → case a/b/c
-                                    → conclusion(含 base_commit/deployed_commit/change/suggested_diff)
+                                    → conclusion(含 base_commit/deployed_commit; recommended_fix = 互斥多方案 FixOption[])
                                           │ conclusion_from_dict（含 sha 幻觉校验）
                                           ▼
-                                     completed（含给人批复的 plan）
+                                     completed（含给人批复的 plan：方案1/方案2…）
+                                          │
+                        POST /remediate（选方案，默认 recommended）→ plan.steps = 选中方案的 steps
                                           │
                         ┌─────────────────┴─────────────────┐
             POST /approve approve                 POST /approve reject(+feedback)
@@ -62,8 +64,9 @@
 **要点**
 - **每个报错日志请求 = 一个 Session + 一个后台 asyncio task**：与现状一致，扩展的是 Issue 承载更多"去哪查"字段 + 按请求解析工具集。
 - **工具集从"启动期单例"改成"每请求解析"**：`resolve_specs(issue)` 决定 agent 看到什么——function tools（todo / fetch_strategy / repo-state）恒在；MCP 端按 `issue.case_type` 绑定 app-log + git。
+- **方案选择在 `/remediate`**：`recommended_fix` 是**有序的互斥方案**（`FixOption`：title / applies_when / recommended / reason / steps）；`/remediate` 选定一个（省略 `option_index` → 默认 `recommended`，再退方案1）并把**该方案的 steps** 快照进 `plan.steps`；`RemediationPlan` 记 `option_index`/`option_title`，`/status` 回显 `remediation_option`。
 - **Approve = 终态签章，零执行**：去掉 `apply_fix`、`ExecutionResult`、`status="executed"`、Session `executed` 态。审批作用在 plan（`RemediationPlan.status: approved`），不作用在执行。
-- **Reject = REST 层动作 + 文本 feedback 回灌**（`compose_user_content` 已支持），非工具级 denial；同一条 plan 对象回到 pending_review（换新 steps）。
+- **Reject = REST 层动作 + 文本 feedback 回灌**（`compose_user_content` 已支持），非工具级 denial；重跑会清空 `remediation`（旧 plan/选项不再适用），新 conclusion 的 options 重新解析，选择在下次 `/remediate` 重新发生。
 
 ### A3. 每请求绑定与 MCP client 生命周期的关系
 
@@ -173,15 +176,15 @@ def build_toolkit(specs, *, recorder=None, mcp_clients=None) -> Toolkit:
 ### Phase 0 — domain（对齐 DESIGN §3）
 | 文件 | 改动 |
 |---|---|
-| `aidiag/domain.py` | Issue 泛化：+`case_type`(默认 `trace_code`)、`app/repo/trace_id/environment/time_window`、`deployed: DeployedRef`；新增 `DeployedRef`；EvidenceItem +`commit`；RemediationStep +`change`/`suggested_diff`；DiagnosticConclusion +`deployed_commit/base_commit/base_note/already_fixed_by`；**删 ExecutionResult**。`conclusion_from_dict` 同步宽容解析 + **sha 幻觉校验**（见 B7）。 |
-| `aidiag/diag/session.py` | RemediationPlan 去 `executed` 态、去 `executions` 字段；Session 去 `executed` 态（保留 analyzing/completed/failed/reanalyze_count/feedbacks）。 |
+| `aidiag/domain.py` | Issue 泛化：+`case_type`(默认 `trace_code`)、`app/repo/trace_id/environment/time_window`、`deployed: DeployedRef`；**+`trigger`(手动/log/metric 来源门)、`log_excerpt`、`metric_alert: MetricAlert`（+新增 `MetricAlert`）**；新增 `DeployedRef`；EvidenceItem +`commit`；RemediationStep +`change`/`suggested_diff`；**新增 `FixOption`**（title/applies_when/recommended/reason/steps）→ `recommended_fix: list[FixOption]`（互斥多方案，有序记 方案N）+ `preferred_option_index`；DiagnosticConclusion +`deployed_commit/base_commit/base_note/already_fixed_by`；**删 ExecutionResult**。`conclusion_from_dict` 同步宽容解析（含旧扁平形状包成单方案）+ **sha 幻觉校验**（见 B7）。 |
+| `aidiag/diag/session.py` | RemediationPlan 去 `executed` 态、去 `executions` 字段，+`option_index`/`option_title`（选中方案）；`snapshot` +`remediation_option`；Session 去 `executed` 态（保留 analyzing/completed/failed/reanalyze_count/feedbacks）。 |
 | `aidiag/diag/remediate.py` | **删除** `apply_fix`（审批无执行）。 |
 
 ### Phase 1 — M3 prompts + runbook registry
 | 文件 | 改动 |
 |---|---|
 | `aidiag/prompts/__init__.py` | `build_system_prompt` **默认不再预烤 strategy**（仅 `issue.strategy` 显式时）；registry（name→.j2→触发签名）单一来源，目录按 case_type 过滤。 |
-| `aidiag/prompts/conclusion.j2` | 契约补 `base_commit/deployed_commit/base_note/already_fixed_by` + `change/suggested_diff`。 |
+| `aidiag/prompts/conclusion.j2` | 契约补 `base_commit/deployed_commit/base_note/already_fixed_by` + `change/suggested_diff`；`recommended_fix` 改为方案数组（title/applies_when/recommended/reason/steps）+ **方案基数/互斥多方案/恰一个首选**规则，target 落点改为 `steps[].target`。 |
 | `aidiag/prompts/planning.j2` | 加一行 fetch 指针："取到首条证据、判定错误类别后，命中某场景就 `fetch_strategy(name)`"。 |
 | `aidiag/prompts/strategy_trace_bug.j2` / `strategy_trace_dependency.j2` / `strategy_trace_startup.j2` | 新增三个 runbook（trace_slow = stretch 不首批）。 |
 
@@ -213,6 +216,27 @@ def build_toolkit(specs, *, recorder=None, mcp_clients=None) -> Toolkit:
 |---|---|
 | `README.md` / `spike_plan_v4.md` | 场景/验证命令更新（trace_code + 真 MCP）。 |
 | memory `aiops-spike.md` | 实现进度恢复点刷新（实现并验证后）。 |
+
+### Phase 6（delta）— 入口按"来源"分门（门 ≠ case_type）
+| 文件 | 改动 |
+|---|---|
+| `aidiag/api.py` | 抽共享脊柱 `_start(issue)`；新增两个**瘦门**：`POST /diagnose/logs`（`LogTriggerRequest`：`log_excerpt`/`app`/`repo`/`trace_id`/`environment`/`time_window`/`deployed`）与 `POST /diagnose/metrics`（`MetricTriggerRequest`：`metric`/`resource`/`value`/`threshold`/`description`/`app`/…）；各自 `_issue_from_log`/`_issue_from_metric`（自动造 title、标 `trigger`、固定 `case_type=trace_code`、**不暴露 case_type**）；`/diagnose` 改走 `_start`（行为/签名不变，仍服务测试/golden/手工）。 |
+| `aidiag/diag/runner.py` | `compose_user_content` 渲染 log 摘录（显式标注"仅供参考 + 须查证 + 引用记 `evidence.source=trigger_log`"）与 metric 告警块——**seed 是提示非结论**。 |
+| `aidiag/diag/session.py` | `snapshot` +`trigger`（来源回显）。 |
+| `tests/test_trigger_doors.py`（新） | 门→Issue 映射、seed 渲染纪律（含"不是结论"/`trigger_log` 字样）、两门共享脊柱。`tests/test_rest_trace_smoke.py` +两门全链路冒烟（断言 `trigger`）。 |
+
+### Phase 7（delta）— HEAD 改走 git MCP（去掉本地 repo-state）
+> 起因：真 git MCP server（`get_repo_status` 等）本身就能给 HEAD；本地 `repo_state` 要求"本地 checkout 必须与 server 同源"，是隐性耦合。改为**统一从 MCP 拿 HEAD**。
+
+| 文件 | 改动 |
+|---|---|
+| `aidiag/api.py` | 删 `from .tools.repo_state import build_repo_state_spec` 与 `_resolve_specs_for` 里 `func_specs.append(build_repo_state_spec(...))`（trace_code 的 function specs 只剩 `fetch_strategy`）；删不再用的 `Path` import；docstring 同步。 |
+| `aidiag/tools/repo_state.py`（删） | 整个文件删除——HEAD 不再由本地 function 工具提供。 |
+| `aidiag/diag/runner.py` | `compose_user_content`：`仓库(repo)` 行补一句"git 工具若需仓库定位参数（如真 server 的 `repo_path`）用此值"。 |
+| `aidiag/prompts/strategy_trace_bug.j2` | 第 2 步"先取 repo-state 的 HEAD" → "先用仓库状态类工具取当前 HEAD" + repo 定位提示。 |
+| `aidiag/config.py` | `repo_cwd` 注释重定位为"仅 mock 布局（`MOCK_GIT_REPO`）用；接真 server 时不使用"。 |
+| `.env.example` | `AIDIAG_REPO_CWD` 说明改为 mock-only；删掉已失效的"必须与真实 checkout 同源"警告。 |
+| `tests/` | 新增回归：trace_code 的 function specs 不含 `repo_state`（只剩 `fetch_strategy`）。 |
 
 ---
 

@@ -27,16 +27,20 @@ from ..prompts import build_system_prompt
 from ..tools.registry import ToolSpec
 from ..tools.todo import build_todo_specs
 from .recorder import MCPRecorderMiddleware, SessionRecorder
-from .session import Session
+from .session import Session, finalize_terminal_tasks
 
 log = logging.getLogger("aidiag.runner")
 
 
 def compose_user_content(issue: Issue, feedbacks: list[str] | None = None) -> str:
-    """把 Issue 渲染成 user 上下文。trace_code 只带定位键，绝不带 bug 签名/根因方向。
+    """把 Issue 渲染成 user 上下文。默认（manual）只带定位键，绝不带根因方向。
 
-    只输出"去哪查 + 基线"：app/repo/trace_id/environment/time_window/deployed；线上基线
+    输出"去哪查 + 基线"：app/repo/trace_id/environment/time_window/deployed；线上基线
     （deployed commit/image）是给 agent 的对齐锚，仍不是答案。
+
+    例外：log/metric 门会把触发源的证据（日志摘录 / 指标告警）一并带上——那是**触发源给的
+    提示，须查证**，不是结论。渲染时显式标明"仅供参考 + 须用工具核对 + 出处记 trigger_log"，
+    避免模型复述摘录收口（丢掉定位 file:line / 读代码这跳）。
     """
     lines: list[str] = [f"场景(case_type): {issue.case_type}"]
     if issue.namespace:
@@ -44,7 +48,10 @@ def compose_user_content(issue: Issue, feedbacks: list[str] | None = None) -> st
     if issue.app:
         lines.append(f"应用(app): {issue.app}")
     if issue.repo:
-        lines.append(f"仓库(repo): {issue.repo}")
+        lines.append(
+            f"仓库(repo): {issue.repo}"
+            "（git 只读工具若需要仓库定位参数——如真 server 的 repo_path——一律用此值）"
+        )
     if issue.trace_id:
         lines.append(f"trace_id: {issue.trace_id}")
     if issue.environment:
@@ -54,6 +61,22 @@ def compose_user_content(issue: Issue, feedbacks: list[str] | None = None) -> st
     if issue.deployed is not None:
         d = issue.deployed
         lines.append(f"线上基线(deployed): {d.kind}={d.value}（来源={d.source}）")
+    if issue.log_excerpt:
+        lines.append(
+            "触发日志摘录（来自监控系统，**仅供参考**）：\n"
+            f"{issue.log_excerpt}\n"
+            "注意：这是摘录、不是结论。请用日志工具取该 trace 的完整日志与栈帧核对，定位到确切 "
+            "file:line 并阅读代码后再下结论；结论若引用此摘录，evidence.source 记 trigger_log。"
+        )
+    if issue.metric_alert is not None:
+        m = issue.metric_alert
+        lines.append(
+            f"指标告警: resource={m.resource} metric={m.metric} "
+            f"value={m.value} threshold={m.threshold}"
+        )
+        if m.description:
+            lines.append(f"告警原文: {m.description}")
+        lines.append("请据此在时间窗内查该服务的日志与代码，定位指标异常的成因。")
     lines.append(f"标题: {issue.title}")
     if issue.description:
         lines.append(f"详情: {issue.description}")
@@ -81,7 +104,7 @@ async def run_diagnose(
 ) -> Session:
     """在传入 session 上执行一次诊断（可被 Stage2 驳回重跑复用）。
 
-    - ``specs`` 是 resolve_specs 已解析出的 function 工具（含 repo_state/fetch_strategy 绑定）；
+    - ``specs`` 是 resolve_specs 已解析出的 function 工具（含 fetch_strategy 绑定）；
     - ``mcp_clients``/``allow_extra``：API 层按 case_type profile 解析出的 MCP client 与其工具
       精确名（allow 注入），透传给 build_agent；
     - ``middlewares``：调用方额外挂的 AgentScope 中间件；若 mcp_clients 非空则补挂
@@ -95,6 +118,7 @@ async def run_diagnose(
     session.tasks.clear()
     session.tool_calls.clear()
     session.conclusion = None
+    session.remediation = None  # 重跑后面向新 conclusion 的方案，旧 plan/选项不再适用
 
     all_specs = list(specs)
     if planning:
@@ -139,5 +163,8 @@ async def run_diagnose(
         log.exception("diagnose failed session=%s", session.id)
         session.error = str(exc)[:2000]
         session.status = "failed"
+    # 终态归一：模型自报 tasks 与 session 终态对齐（结论走另一条通道，收尾步骤不会被
+    # complete_task 标记；这里确定性收敛。失败态绝不置 done → cancelled）。
+    finalize_terminal_tasks(session, ok=session.status == "completed")
     session.touch()
     return session

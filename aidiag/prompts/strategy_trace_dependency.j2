@@ -17,7 +17,7 @@
    - 写死的地址已不可达 → 这算仓库缺陷：action=`code_fix`，按兜底 trace_bug 的版本对齐纪律
      （锚 deployed、比 HEAD、case a/b/c）出 diff，但**先别下"依赖挂了"的结论**——地址都写死了，
      依赖迁移后代码没跟上也是同症状。
-4. **不要越权探测**：runbook 只做只读诊断；不要声称"已重连/已重启依赖"。recommended_fix 是给人
-   批复的建议，执行方在别处。
+4. **不要越权探测**：runbook 只做只读诊断；不要声称"已重连/已重启依赖"。recommended_fix（方案级，
+   多方案时各自带 `applies_when`）是给人批复的建议，执行方在别处。
 5. **收敛**：拿到"日志原文 host:port + 代码/配置侧来源 + 判定"即可停，输出结论 JSON；证据不足
    就把 root_cause 写成"证据不足"、confidence 压到 medium/low，不要硬猜依赖是否真的挂。

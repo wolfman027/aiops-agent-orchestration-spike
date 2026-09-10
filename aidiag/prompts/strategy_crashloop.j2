@@ -17,4 +17,4 @@
    - 配置缺失/错误 → `config_change`
    - 代码缺陷（如连接池参数导致启动即崩）→ `code_fix`
    - 资源不足/OOM → `scale`（调资源/副本）
-6. recommended_fix 只给**建议**，不许声称已执行；每个 action 的 target 必须是你查证过的资源。
+6. recommended_fix 只给**建议**，不许声称已执行；每个方案 `steps[]` 的 target 必须是你查证过的资源。

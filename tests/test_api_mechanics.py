@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 import aidiag.api as api_mod
 from aidiag.config import get_settings
 from aidiag.diag.session import Session, SessionStore
-from aidiag.domain import DiagnosticConclusion, EvidenceItem, Issue, RemediationStep
+from aidiag.domain import DiagnosticConclusion, EvidenceItem, FixOption, Issue, RemediationStep
 
 
 def _conclusion() -> DiagnosticConclusion:
@@ -38,15 +38,54 @@ def _conclusion() -> DiagnosticConclusion:
             )
         ],
         recommended_fix=[
-            RemediationStep(
-                action="config_change",
-                target="Deployment checkout",
-                expected_effect="恢复启动",
-                risk="low",
-                rollback="回滚配置",
+            FixOption(
+                title="改依赖地址",
+                applies_when="日志与配置一致、依赖本身健康",
+                recommended=True,
+                reason="证据指向地址配错",
+                steps=[
+                    RemediationStep(
+                        action="config_change",
+                        target="Deployment checkout",
+                        expected_effect="恢复启动",
+                        risk="low",
+                        rollback="回滚配置",
+                    )
+                ],
             )
         ],
     )
+
+
+def _conclusion_multi(*, mark_second: bool = False, mark_none: bool = False) -> DiagnosticConclusion:
+    """两个互斥方案：方案1 target=Deployment checkout / 方案2 target=Deployment payment-db。
+
+    默认方案1 recommended；mark_second 反向标记；mark_none 两个都不标（测兜底）。
+    """
+    c = _conclusion()
+    opt1 = FixOption(
+        title="改 checkout 配置",
+        applies_when="checkout 侧地址配错",
+        recommended=not (mark_second or mark_none),
+        reason="日志原文指向 checkout",
+        steps=[
+            RemediationStep(
+                action="config_change", target="Deployment checkout", risk="low", rollback="回滚配置"
+            )
+        ],
+    )
+    opt2 = FixOption(
+        title="重启依赖 Db",
+        applies_when="依赖 Db 本身不健康",
+        recommended=mark_second,
+        reason="依赖方不健康则重启依赖",
+        steps=[
+            RemediationStep(
+                action="restart", target="Deployment payment-db", risk="medium", rollback="无"
+            )
+        ],
+    )
+    return c.model_copy(update={"recommended_fix": [opt1, opt2]})
 
 
 def _seed(store: SessionStore) -> Session:
@@ -117,8 +156,79 @@ async def test_remediate_submits_pending_review(store):
     s = _seed(store)
     out = await api_mod.remediate(s.id)
     assert out["remediation_status"] == "pending_review"
+    assert out["option_index"] == 1
     assert len(out["steps"]) == 1
     assert out["steps"][0]["target"] == "Deployment checkout"
+    # 计划记录选中的方案，供 /status 回显
+    plan = store.get(s.id).remediation
+    assert plan.option_index == 1
+    assert plan.option_title == "改依赖地址"
+
+
+# ======================================================================
+# /remediate 选方案（默认 recommended / 显式 option_index / 边界）
+# ======================================================================
+@pytest.mark.asyncio
+async def test_remediate_selects_recommended_by_default(store):
+    s = _seed(store)
+    s.conclusion = _conclusion_multi()  # 方案1 标记 recommended
+    out = await api_mod.remediate(s.id)
+    assert out["option_index"] == 1
+    assert out["option_title"] == "改 checkout 配置"
+    assert [st["target"] for st in out["steps"]] == ["Deployment checkout"]
+
+
+@pytest.mark.asyncio
+async def test_remediate_default_prefers_marked_second(store):
+    s = _seed(store)
+    s.conclusion = _conclusion_multi(mark_second=True)  # 方案2 标记 recommended
+    out = await api_mod.remediate(s.id)
+    assert out["option_index"] == 2
+    assert [st["target"] for st in out["steps"]] == ["Deployment payment-db"]
+
+
+@pytest.mark.asyncio
+async def test_remediate_default_falls_back_to_first_when_none_marked(store):
+    s = _seed(store)
+    s.conclusion = _conclusion_multi(mark_none=True)  # 两个都未标记 → 兜底方案1
+    out = await api_mod.remediate(s.id)
+    assert out["option_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_remediate_selects_by_option_index(store):
+    s = _seed(store)
+    s.conclusion = _conclusion_multi()
+    out = await api_mod.remediate(s.id, api_mod.RemediateRequest(option_index=2))
+    assert out["option_index"] == 2
+    assert out["option_title"] == "重启依赖 Db"
+    assert [st["target"] for st in out["steps"]] == ["Deployment payment-db"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [0, 5])
+async def test_remediate_invalid_option_index_4xx(store, bad):
+    s = _seed(store)
+    s.conclusion = _conclusion_multi()
+    with pytest.raises(HTTPException) as ei:
+        await api_mod.remediate(s.id, api_mod.RemediateRequest(option_index=bad))
+    assert ei.value.status_code == 400
+    detail = ei.value.detail
+    assert detail["requested"] == bad
+    assert [o["index"] for o in detail["available"]] == [1, 2]
+    assert all("title" in o and "recommended" in o for o in detail["available"])
+    assert store.get(s.id).remediation is None  # 未落计划
+
+
+@pytest.mark.asyncio
+async def test_remediate_option_with_empty_steps_conflicts(store):
+    s = _seed(store)
+    empty = FixOption(title="空方案", recommended=True, steps=[])
+    s.conclusion = _conclusion().model_copy(update={"recommended_fix": [empty]})
+    with pytest.raises(HTTPException) as ei:
+        await api_mod.remediate(s.id)
+    assert ei.value.status_code == 409
+    assert store.get(s.id).remediation is None
 
 
 # ======================================================================
@@ -257,3 +367,22 @@ def test_http_remediate_approve_round_trip(store):
         # 未知 session → 404
         assert client.get("/status/nope").status_code == 404
         assert client.post("/remediate/nope").status_code == 404
+
+
+def test_http_remediate_select_option_round_trip(store):
+    s = _seed(store)
+    s.conclusion = _conclusion_multi()
+    with TestClient(api_mod.app) as client:
+        r = client.post(f"/remediate/{s.id}", json={"option_index": 2})
+        assert r.status_code == 200
+        assert r.json()["option_index"] == 2
+        assert r.json()["option_title"] == "重启依赖 Db"
+
+        # 越界 → 400（detail 带 requested + available）
+        r2 = client.post(f"/remediate/{s.id}", json={"option_index": 9})
+        assert r2.status_code == 400
+        assert r2.json()["detail"]["requested"] == 9
+
+    # /status 回显选中方案
+    snap = store.snapshot(s.id)
+    assert snap["remediation_option"] == {"index": 2, "title": "重启依赖 Db"}

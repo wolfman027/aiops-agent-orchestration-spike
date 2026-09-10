@@ -18,16 +18,23 @@ from ..tools.progress import ToolCallEvent
 
 
 class InvestigationTask(BaseModel):
+    """调研计划里的一步。**状态是模型自报账本**：只有 complete_task 工具会写 done。"""
+
     id: str
     title: str
-    status: str = "todo"  # todo | in_progress | done | failed
+    status: str = "todo"  # todo | in_progress | done | cancelled
+    # True = 该终态不是模型显式 complete_task，而是终态归一（finalize_terminal_tasks）补写的。
+    # 用途：UI 灰显「随结论完成」，不冒充模型显式完成。
+    derived: bool = False
 
 
 class RemediationPlan(BaseModel):
     """计划级审批（TRACE_CODE_DESIGN §3 L3）：approve 是终态签章，零下游动作。"""
 
     status: str = "pending_review"  # pending_review|approved|rejected|closed_manual
-    steps: list[RemediationStep] = Field(default_factory=list)
+    steps: list[RemediationStep] = Field(default_factory=list)  # = 选定 FixOption.steps 的快照
+    option_index: int | None = None  # 1-based，与「方案N」对齐；None=未知
+    option_title: str = ""
     last_feedback: str = ""
     submitted_at: float = Field(default_factory=time.time)
     decided_at: float | None = None
@@ -53,6 +60,33 @@ class Session(BaseModel):
 
     def touch(self) -> None:
         self.updated_at = time.time()
+
+
+def finalize_terminal_tasks(session: Session, ok: bool) -> None:
+    """终态归一：把模型自报的 tasks 收敛到与 session 终态一致（**确定性**，不靠模型自觉）。
+
+    症结：task 状态是模型自报账本——只有 ``complete_task`` 工具会写 done；而最终结论走的是
+    另一条通道（runner 解析模型最后那条 JSON）。于是"收敛根因并给出修复方案"这类**收尾步骤**
+    永远没人置 done，``completed`` 的会话却显示 ``todo``。
+
+    规则（**必须在 session.status 落到终态之后**调用）：
+
+    - ``ok=True``（completed/approved，结论已出）：残留 todo/in_progress → ``done`` 且
+      ``derived=True``。语义是"随结论一并完成"，derived 供 UI 灰显，不冒充显式完成。
+    - ``ok=False``（failed/closed_manual，**没有结论**）：残留 → ``cancelled``。绝不置 done
+      ——终态失败不能伪造完成。
+
+    已是 done/failed/cancelled 的一律保持原样（不覆盖模型显式结果，也不重复处理）。
+    """
+    if ok:
+        for t in session.tasks:
+            if t.status in ("todo", "in_progress"):
+                t.status = "done"
+                t.derived = True
+    else:
+        for t in session.tasks:
+            if t.status in ("todo", "in_progress"):
+                t.status = "cancelled"
 
 
 class SessionStore:
@@ -97,11 +131,17 @@ class SessionStore:
         return {
             "session_id": s.id,
             "status": s.status,
+            "trigger": s.issue.trigger,
             "issue_title": s.issue.title,
             "tasks": [t.model_dump() for t in s.tasks],
             "tool_calls": [t.model_dump() for t in s.tool_calls],
             "reanalyze_count": s.reanalyze_count,
             "remediation_status": s.remediation.status if s.remediation else None,
+            "remediation_option": (
+                {"index": s.remediation.option_index, "title": s.remediation.option_title}
+                if s.remediation is not None and s.remediation.option_index is not None
+                else None
+            ),
             "conclusion": s.conclusion.model_dump() if s.conclusion else None,
             "error": s.error,
             "created_at": s.created_at,

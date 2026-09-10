@@ -73,6 +73,18 @@ class Issue(BaseModel):                                # [改] 从"告警"泛化
     namespace: str = ""             # k8s legacy 字段；trace_code 下留空
     strategy: str | None = None     # 显式 runbook 名；trace_code 默认不设（走 M3 fetch）
 
+    trigger: Literal["manual", "log", "metric"] = "manual"  # [新] 来源门（provenance）
+    log_excerpt: str = ""           # [新] log 门：监控给的日志摘录（提示，须查证；非结论）
+    metric_alert: MetricAlert | None = None  # [新] metric 门：告警内容
+
+
+class MetricAlert(BaseModel):                          # [新] metric 门输入（只描述"什么指标、多少、什么条件"）
+    metric: str = ""
+    value: str = ""
+    threshold: str = ""
+    resource: str = ""               # pod / 服务 / deployment
+    description: str = ""            # 原始告警文本（可选）
+
 
 class DeployedRef(BaseModel):                          # [新]
     kind: Literal["commit", "image"]
@@ -89,7 +101,7 @@ class EvidenceItem(BaseModel):                         # [现] 语义不变
     commit: str | None = None        # [新] 可选：这条证据取自哪个 commit（deployed 还是 base）
 
 
-class RemediationStep(BaseModel):                     # = recommended_fix[] 的一项
+class RemediationStep(BaseModel):                     # = FixOption.steps[] 的一项
     action: Literal["code_fix", "config_change", "restart", "scale", "db_action"] = "code_fix"
     target: str = ""                 # [改] infra=资源名；code=文件路径（须与 git 返回一致）
     change: str = ""                 # [新] 纯文本"怎么改"（code_fix 必填）
@@ -97,6 +109,16 @@ class RemediationStep(BaseModel):                     # = recommended_fix[] 的�
     risk: Literal["low", "medium", "high"] = "medium"
     rollback: str = ""               # code_fix 通常 "git revert <base>" 或撤该 commit
     suggested_diff: str | None = None  # [新] 示意 diff（给人看、无执行语义）；仅 action∈{code_fix,config_change}
+
+
+class FixOption(BaseModel):                            # [新] = recommended_fix[] 的一项（一个方案）
+    title: str = ""                  # 短标签，如 "空安全 trim（assignee 可空）"
+    applies_when: str = ""           # 选择本方案的前提条件（消歧关键）；单方案时写主要适用场景
+    recommended: bool = False        # 模型首选（恰一个为 true；系统确定性兜底）
+    reason: str = ""                 # 一句话：为何推荐本方案（或该备选为何存在）
+    steps: list[RemediationStep] = Field(default_factory=list)
+# 方案有序，对外一律按 1-based 记作 方案1、方案2…。根因依赖未定前提时给互斥多方案
+# （各写 applies_when），否则只给一个方案——避免把"二选一"读成"两个都做"。
 
 
 class DiagnosticConclusion(BaseModel):                 # = plan 本体，给人批复
@@ -107,16 +129,22 @@ class DiagnosticConclusion(BaseModel):                 # = plan 本体，给人�
     deployed_commit: str | None = None  # [新] 证据锚点：日志栈帧对应的线上 sha
     base_commit: str | None = None      # [新] diff 落点：默认 HEAD tip；必须显式给出
     base_note: str = ""                 # [新] deployed≠base 时写 case a/b/c 判定 + 迁移描述
-    already_fixed_by: str | None = None # [新] 非空 = 无需新改动，已由 commit X 修复；recommended_fix 应为空
+    already_fixed_by: str | None = None # [新] 非空 = 无需新改动，已由 commit X 修复；recommended_fix 应为 0 个方案
 
     evidence: list[EvidenceItem] = Field(default_factory=list)
-    recommended_fix: list[RemediationStep] = Field(default_factory=list)
+    recommended_fix: list[FixOption] = Field(default_factory=list)   # [改] 有序方案（原为扁平 list[RemediationStep]）
+
+
+def preferred_option_index(options: list[FixOption]) -> int | None:
+    """确定性选主（0-based）：第一个 recommended=True；零标记 → 0；空 → None。绝不抛错。"""
 
 
 # ========== L3. 审批状态（aidiag 管）—— approve 是终态标签，零下游动作 ==========
 class RemediationPlan(BaseModel):                      # [改] 语义从"执行记录"改为"计划审批"
     status: str = "pending_review"   # pending_review | approved | rejected | closed_manual   [改] 去掉 executed
-    steps: list[RemediationStep] = Field(default_factory=list)  # = conclusion.recommended_fix 快照
+    steps: list[RemediationStep] = Field(default_factory=list)  # = 选定 FixOption.steps 的快照
+    option_index: int | None = None  # [新] 1-based，与「方案N」对齐；None=未知
+    option_title: str = ""           # [新] 选定方案的 title（/status 回显）
     last_feedback: str = ""
     submitted_at: float = Field(default_factory=time.time)
     decided_at: float | None = None
@@ -126,6 +154,35 @@ class RemediationPlan(BaseModel):                      # [改] 语义从"执行�
 ```
 
 **必须三件同步改**：`aidiag/domain.py` 模型、`conclusion_from_dict` 宽容解析、`aidiag/prompts/conclusion.j2` 契约文本（让 LLM 知道要输出 base_commit / already_fixed_by / change / suggested_diff）。
+
+**改动输出形状时另需同步**（如 `recommended_fix` 扁平 → `FixOption` 多方案）：`aidiag/api.py` 的
+`/remediate`（方案选择器 `{"option_index": N}`，1-based；只快照选中方案的 `steps`）、
+`RemediationPlan.option_index/option_title`、`SessionStore.snapshot` 的 `remediation_option`，
+以及 `scripts/run_golden.py` 的 target 断言（须穿透 options → steps）。
+
+### 3.1 调研任务台账（`tasks`）的终态归一纪律
+
+`Session.tasks`（`InvestigationTask`）是**模型自报账本**：`plan_investigation` 写计划、
+`complete_task` 是**唯一**写 `status="done"` 的地方。而**最终结论走的是另一条通道**——runner 解析
+模型最后那条 JSON。于是"收敛根因并给出修复方案"这类**收尾步骤**永远没人置 done，
+`completed` 的会话却显示 `todo`。
+
+**契约（由 `diag/session.py::finalize_terminal_tasks` 确定性保证，不靠提示词自觉）：**
+
+> `session.status` 落到终态 ⇒ `tasks` 中不存在 `todo` / `in_progress`。
+
+| session 终态 | 残留 todo/in_progress → | 语义 |
+|---|---|---|
+| `completed` / `approved` | `done` + `derived=True` | 有结论，收尾步骤**随结论一并完成**（derived 供 UI 灰显，不冒充模型显式完成） |
+| `failed` / `closed_manual` | `cancelled` | **无结论**，步骤没跑完——绝不置 `done`，不伪造完成 |
+
+调用点必须覆盖**每一条**落终态的路径：`diag/runner.py`（成功/异常两处）、`api.py` 的
+`/stop` 与 `_schedule_run` 的 resolve 失败分支。`InvestigationTask.derived` 与
+（新增的）`cancelled` 仅作**加法**扩进 `/status` 快照，不破既有字段。
+
+前端（Problem Center「View diagnosis」）在同一契约上做**显示侧兜底**：终态却仍见
+`todo`/`in_progress`（旧会话/异常路径）时不再印原始枚举，而是按上表派生成
+「随结论完成」/「已中止」；非终态照常显示 待办/进行中/已完成。
 
 ---
 
@@ -140,13 +197,13 @@ class RemediationPlan(BaseModel):                      # [改] 语义从"执行�
 | 情况 | 事实 | plan 动作 |
 |---|---|---|
 | a. 代码没动 | C_deploy 该文件与 HEAD 一致 | 直接以 HEAD 为底出 diff |
-| b. 上游已修 | `C_deploy..HEAD` 间错误已被修掉 | **不写 diff**，填 `already_fixed_by=修复 commit`，recommended_fix 为空。判定靠 `git log -S "<错误签名>" C_deploy..HEAD -- <file>` |
+| b. 上游已修 | `C_deploy..HEAD` 间错误已被修掉 | **不写 diff**，填 `already_fixed_by=修复 commit`，recommended_fix 应为 **0 个方案**。判定靠 `git log -S "<错误签名>" C_deploy..HEAD -- <file>` |
 | c. 改了但还在 | 重构挪位/改法，错误仍复现 | 以 HEAD 为底，但**禁用旧 file:line**——用错误签名在 HEAD 上重搜定位，再出 diff |
 
 ### 4.3 base_commit 纪律（反幻觉的硬约束）
 - **agent 只做选择/引用，绝不拼 sha**：任何出现在 plan 里的 sha（`base_commit` / `deployed_commit` / `already_fixed_by` / `EvidenceItem.commit`）**必须是某次工具返回里出现过的 sha**。
-- 因此 git 层新增一个 **repo-state 工具**：显式返回 HEAD sha（及可解析的部署 sha），LLM 从中引用。
-- `conclusion_from_dict` 加校验：plan 里的 sha 若从未在工具输出中出现 → 当作幻觉处理（降级 confidence / 拒收）。这复用并推广了既有的"`recommended_fix[].target` 只能引用工具返回中出现过的资源"铁律。
+- 因此 HEAD 由 **git MCP 的仓库状态工具**显式返回（真 server `get_repo_status` / mock `git_status`），LLM 从中引用；不再有本地 repo-state function 工具（避免"本地 checkout 必须与 server 同源"的隐性耦合）。
+- `conclusion_from_dict` 加校验：plan 里的 sha 若从未在工具输出中出现 → 当作幻觉处理（降级 confidence / 拒收）。这复用并推广了既有的"`recommended_fix[].steps[].target` 只能引用工具返回中出现过的资源"铁律。
 - diff 的 before 侧必须是 agent 在**目标 commit** 下 `git show` 拉到的真实内容；在 HEAD 定位不到与日志一致的地方 → **明说 + 降 confidence**，不硬凑。
 
 ---
@@ -160,6 +217,8 @@ class RemediationPlan(BaseModel):                      # [改] 语义从"执行�
 - **只给"去哪查"，不给"答案"**：输入里的 app/trace/repo/deployed 全是 WHERE + base 元数据；错误签名、可疑代码、根因方向**一个字符都不能进输入**——否则亲手喂掉 discovery，golden 防幻觉断言全废。
 - **log 请求形态**：app + trace_id 都给定（agent 第一跳 = 拉这条 trace）。不做服务发现/路由。
 - **app-log MCP 查询原语（已确认）**：既支持 `trace_id` 拉单条 trace，也支持 **app + 时间窗（无 trace）** 拉日志——后者支撑 `trace_startup` 等无 trace 场景。
+- **入口按"来源"分门（门 ≠ case_type）**：触发源是采集系统，不是人。**门（source）** 决定请求体形状与 provenance（`trigger`），**case_type** 只决定后端绑什么数据源。`POST /diagnose` = 通用/人工门（`manual`）；`POST /diagnose/logs` = 日志采集门；`POST /diagnose/metrics` = 指标采集门。三门汇入同一 `_start()`，后端诊断流程一致；两个专用门不暴露 `case_type`（都映射 `trace_code`）。`/status` 回显 `trigger`。
+- **seed 是"提示"不是"结论"**：`log` 门随体带上日志摘录（`raw_logs`/`log_excerpt`），`metric` 门带上告警内容——**这是触发源给的证据**，渲染进 user 上下文时**必须显式标注"仅供参考 + 须用日志工具取完整日志/栈帧核对"**，且结论引用它时 `evidence.source` 记 **`trigger_log`**（区别于工具返回的 `app_log`）。否则模型会把异常复述成结论，跳过"定位 file:line → 读代码 → 定方案"这跳（golden 防幻觉断言只对**不带 seed** 的 `/diagnose` 门成立）。日志摘录**建议只给异常 message、不含 `at` 栈帧**，保留 agent 自查 file:line 的价值。
 
 ---
 
@@ -216,7 +275,7 @@ class RemediationPlan(BaseModel):                      # [改] 语义从"执行�
 | `aidiag/prompts/planning.j2` | 加 fetch_strategy 指针行 |
 | `aidiag/prompts/methodology.j2` | 基本不动（大方向适用；如需可加一句"file+commit 是精确命名对象"） |
 | `aidiag/prompts/__init__.py` | build_system_prompt 默认不烤 strategy（仅显式时）；registry 单一来源 |
-| `aidiag/tools/` | + repo-state 工具；+ fetch_strategy 工具；runbook registry 模块 |
+| `aidiag/tools/` | + fetch_strategy 工具；runbook registry 模块（HEAD 不再用本地 repo-state，改走 git MCP 仓库状态工具） |
 | `aidiag/diag/runner.py` | 走 registry + fetch 工具集装配（trace_code 时） |
 | `aidiag/prompts/strategy_*.j2` | 新增 trace_bug / trace_dependency / trace_startup（/ trace_slow） |
 | `tests/` | 发现型 golden + sha 幻觉单测 |

@@ -14,7 +14,7 @@
    - 初始化代码缺陷（连接池参数、空指针、顺序错）→ `code_fix`，按 trace_bug 的版本对齐纪律出 diff；
    - 日志现 `OutOfMemoryError` 等**资源型**栈 → 归本 runbook 子分支处理，但见第 5 条。
 5. **证据弱边界（反幻觉）**：本 runbook 无 k8s 的 exit_code/events，**无法证实进程级崩溃**（SIGKILL/
-   OOMKilled=137 在纯日志里无痕迹）。若症状像资源型（反复重启、无业务异常即死），recommended_fix 里
-   **必须写明"需回 k8s case_type 用 describe_pod/events 佐证"**，并把 confidence 压到 medium 以下——
+   OOMKilled=137 在纯日志里无痕迹）。若症状像资源型（反复重启、无业务异常即死），该方案的
+   `steps`/`change` 里**必须写明"需回 k8s case_type 用 describe_pod/events 佐证"**，并把 confidence 压到 medium 以下——
    不要凭纯日志断言"内存不足导致崩溃"。
 6. **收敛**：拿到"启动期错误原文 + git 侧触发代码 + 归类"即可停；无法定位根因就明确写证据不足。

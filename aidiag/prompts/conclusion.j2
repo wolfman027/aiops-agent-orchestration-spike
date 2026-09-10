@@ -17,13 +17,21 @@
   ],
   "recommended_fix": [
     {
-      "action": "code_fix | config_change | restart | scale | db_action 之一",
-      "target": "infra=资源名；code=文件路径（须与 git 返回的文件路径一致）",
-      "change": "纯文本'怎么改'（code_fix 必填：改哪个文件哪段逻辑、怎么改）",
-      "expected_effect": "执行后预期的效果",
-      "risk": "low | medium | high",
-      "rollback": "如何回滚；无则写 '无'",
-      "suggested_diff": "可选：示意 diff（给人看，无执行语义）；仅 code_fix/config_change 用"
+      "title": "方案短标签（如：空安全 trim / 补 @NotBlank 校验）",
+      "applies_when": "选择本方案的前提条件（如：assignee 允许为空）；单方案时写其主要适用场景",
+      "recommended": true,
+      "reason": "一句话：为何推荐本方案（或该备选为何存在）",
+      "steps": [
+        {
+          "action": "code_fix | config_change | restart | scale | db_action 之一",
+          "target": "infra=资源名；code=文件路径（须与 git 返回的文件路径一致）",
+          "change": "纯文本'怎么改'（code_fix 必填：改哪个文件哪段逻辑、怎么改）",
+          "expected_effect": "执行后预期的效果",
+          "risk": "low | medium | high",
+          "rollback": "如何回滚；无则写 '无'",
+          "suggested_diff": "可选：示意 diff（给人看，无执行语义）；仅 code_fix/config_change 用"
+        }
+      ]
     }
   ]
 }
@@ -41,8 +49,16 @@
 
 ## 约束
 - `evidence[].supporting_text` 与 `root_cause` 里的唯一标识**必须来自工具返回**，禁止编造。
-- `recommended_fix[].target` 只能引用工具返回中出现过的资源（deployment/pod/容器/依赖服务名）
+- `recommended_fix[].steps[].target` 只能引用工具返回中出现过的资源（deployment/pod/容器/依赖服务名）
   或**文件路径**；不得引入你没查证过的资源/文件。
+- **方案基数**：`recommended_fix` 的每个元素 = 一个**完整且自洽**的修复方案。同一方案的必要多步放在
+  **同一**个方案的 `steps` 里，**不要**把同一方案的多步拆成多个方案。
+- **不确定 → 多方案（互斥备选）**：当根因依赖**未决前提**（典型：未定的业务规则，如某字段是否必填、
+  边界条件）时，给出**互斥**方案，并用各方案的 `applies_when` 写明其成立前提（这正是消歧点）；
+  否则只给**一个**方案。
+- **有序 + 编号**：方案按 1-based 记作 方案1、方案2…；顺序即推荐阅读顺序。
+- **恰一个首选**：必须恰有一个方案标 `recommended=true` 并在 `reason` 说明；没有把握时把最保守/
+  最可能成立的方案标 true（系统兜底：多个标记取第一个、零个标记取方案1）。
 - **sha 纪律**：plan 里出现的任何 sha（base/deployed/already_fixed_by/evidence.commit）**必须是
   某次工具返回里出现过的 sha**。你只做选择/引用，绝不拼写或猜测 sha；没有就把字段留空/省略。
 - evidence 至少 2 条：既要有“现象/请求失败原文”，也要有“根因线索”（日志原文或代码/提交证据）。

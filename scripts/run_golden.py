@@ -44,10 +44,13 @@ def _check_case(cfg: dict, conc: DiagnosticConclusion) -> list[str]:
     if expect.get("fix_nonempty") and not conc.recommended_fix:
         failures.append("recommended_fix 为空")
     scopes = expect.get("fix_target_scope", [])
-    for i, step in enumerate(conc.recommended_fix):
-        t = step.target
-        if scopes and not any(s in t for s in scopes):
-            failures.append(f"recommended_fix[{i}].target={t!r} 超出查证范围（须含 {scopes} 之一）")
+    for oi, opt in enumerate(conc.recommended_fix):
+        for si, step in enumerate(opt.steps):
+            t = step.target
+            if scopes and not any(s in t for s in scopes):
+                failures.append(
+                    f"recommended_fix[{oi}].steps[{si}].target={t!r} 超出查证范围（须含 {scopes} 之一）"
+                )
     if conc.evidence and len(conc.evidence) < expect.get("min_evidence", 0):
         failures.append(f"evidence 不足 {expect.get('min_evidence')} 条")
     return failures

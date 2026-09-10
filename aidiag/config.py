@@ -56,7 +56,8 @@ class Settings(BaseSettings):
     applog_mcp_token: str = Field(default="")
     # mock app-log 数据集文件（JSON，见 scripts/mock_applog_mcp.py 形状）；留空用内置默认
     applog_mock_data: str = Field(default="")
-    # repo 基线：repo_state 工具 / git mock 服务器操作的工作区（app→repo 收敛到单仓库）
+    # 本地 mock git server 的工作区（MOCK_GIT_REPO；仅 mock 布局用）。接真 server 时不使用：
+    # 仓库内容与 HEAD 都走 MCP，仓库定位由请求体的 repo 值决定。
     repo_cwd: str = Field(default=str(ROOT))
 
     # ---- 诊断 agent 默认 ----

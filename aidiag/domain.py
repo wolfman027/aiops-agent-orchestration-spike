@@ -1,4 +1,4 @@
-"""领域模型：Issue / Evidence / RemediationStep / DiagnosticConclusion（TRACE_CODE_DESIGN §3）。
+"""领域模型：Issue / Evidence / RemediationStep / FixOption / DiagnosticConclusion（TRACE_CODE_DESIGN §3）。
 
 与 prompts/conclusion.j2 的 JSON 契约一一对应；parse 时宽容（缺字段给默认）。
 """
@@ -17,11 +17,22 @@ _RISK_LEVELS = ("low", "medium", "high")
 _SHA_RE = re.compile(r"\b[0-9a-fA-F]{7,64}\b")
 
 
+class MetricAlert(BaseModel):
+    """指标告警（metric 门输入）：只描述"什么指标、多少、什么条件"，不含根因方向。"""
+
+    metric: str = ""  # 指标名
+    value: str = ""  # 观测值
+    threshold: str = ""  # 触发条件/阈值
+    resource: str = ""  # 资源（pod / 服务 / deployment）
+    description: str = ""  # 原始告警文本（可选）
+
+
 class Issue(BaseModel):
     """一条待诊断请求。只带"去哪查 + 基线"，绝不携带 bug 签名/根因方向（防作弊）。"""
 
     id: str = "issue-1"
     case_type: Literal["trace_code", "k8s"] = "trace_code"  # 外层平台按可达 MCP 分派定
+    trigger: Literal["manual", "log", "metric"] = "manual"  # 来源门（provenance）
     title: str = ""
     description: str = ""  # trace_code 下可只写"诊断 trace T-xxx 的失败请求"
     app: str | None = None  # 日志源身份（agent 第一跳）
@@ -32,6 +43,8 @@ class Issue(BaseModel):
     deployed: DeployedRef | None = None  # 线上基线（优 = 平台直接给 commit）
     namespace: str = ""  # k8s legacy；trace_code 下留空
     strategy: str | None = None  # 显式 runbook 名；trace_code 默认不设（走 M3 fetch）
+    log_excerpt: str = ""  # log 门：监控给的日志摘录（提示，须查证；非结论）
+    metric_alert: MetricAlert | None = None  # metric 门：告警内容
 
 
 class DeployedRef(BaseModel):
@@ -60,6 +73,31 @@ class RemediationStep(BaseModel):
     suggested_diff: str | None = Field(default=None, description="示意 diff（给人看、无执行语义）")
 
 
+class FixOption(BaseModel):
+    """一个完整且自洽的修复方案。根因存在未定前提时可有多个互斥备选；
+    ``applies_when`` 写明各方案成立的前提（消歧关键），``recommended`` 标模型首选。
+    方案有序，对外一律按 1-based 记作 方案1、方案2…。"""
+
+    title: str = Field(default="", description="短标签，如 '空安全 trim（assignee 可空）'")
+    applies_when: str = Field(default="", description="选择本方案的前提条件；单方案时写主要适用场景")
+    recommended: bool = False
+    reason: str = ""  # 一句话：为何推荐本方案（或该备选为何存在）
+    steps: list[RemediationStep] = Field(default_factory=list)
+
+
+def preferred_option_index(options: list[FixOption]) -> int | None:
+    """确定性选主方案（0-based）：第一个 recommended=True；否则 0（方案1）；无方案 → None。
+
+    多个标记取第一个、零个标记取方案1，绝不抛错（兜底责任在系统，不在模型）。
+    """
+    if not options:
+        return None
+    for i, o in enumerate(options):
+        if o.recommended:
+            return i
+    return 0
+
+
 class DiagnosticConclusion(BaseModel):
     """只读诊断的终点 = 给人批复的 plan。recommended_fix 只是建议，不执行。"""
 
@@ -71,10 +109,10 @@ class DiagnosticConclusion(BaseModel):
     deployed_commit: str | None = None  # 证据锚点：日志栈帧对应的线上 sha
     base_commit: str | None = None  # diff 落点：默认 HEAD tip；必须显式给出
     base_note: str = ""  # deployed≠base 时写 case a/b/c 判定
-    already_fixed_by: str | None = None  # 非空=无需新改动；recommended_fix 应为空
+    already_fixed_by: str | None = None  # 非空=无需新改动；recommended_fix 应为 0 个方案
 
     evidence: list[EvidenceItem] = Field(default_factory=list)
-    recommended_fix: list[RemediationStep] = Field(default_factory=list)
+    recommended_fix: list[FixOption] = Field(default_factory=list)  # 有序方案；方案1..N
 
 
 # ======================================================================
@@ -92,6 +130,70 @@ def _opt_str(v: Any) -> str | None:
     return s or None
 
 
+def _as_bool(v: Any) -> bool:
+    """宽容布尔：True / 'true' / 'yes' / '1' / 'y' 视为真。"""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("true", "yes", "1", "y")
+
+
+def _parse_steps(raw: Any) -> list[RemediationStep]:
+    """把 dict 列表归一到 RemediationStep 列表（action/risk 收敛为合法枚举）。"""
+    out: list[RemediationStep] = []
+    for r in raw or []:
+        if not isinstance(r, dict):
+            continue
+        action = _str(r.get("action")) or "code_fix"
+        if action not in _ACTIONS:
+            action = "code_fix"
+        risk = r.get("risk") or "medium"
+        if risk not in _RISK_LEVELS:
+            risk = "medium"
+        out.append(
+            RemediationStep(
+                action=action,  # type: ignore[arg-type]
+                target=_str(r.get("target")),
+                change=_str(r.get("change")),
+                expected_effect=_str(r.get("expected_effect")),
+                risk=risk,  # type: ignore[arg-type]
+                rollback=_str(r.get("rollback")),
+                suggested_diff=_opt_str(r.get("suggested_diff")),
+            )
+        )
+    return out
+
+
+def _parse_options(raw: Any) -> list[FixOption]:
+    """宽容解析 recommended_fix 为 FixOption 列表。
+
+    新形状（含 steps/title/applies_when）→ FixOption；旧扁平形状（含 target/action、
+    无 steps）→ 包成单个 FixOption，不丢（本解析器一贯宽容，静默丢弃真实修复代价更大）。
+    raw 为单个 dict 时视为单元素列表；非 dict 元素跳过。
+    """
+    if isinstance(raw, dict):
+        raw = [raw]
+    out: list[FixOption] = []
+    for i, o in enumerate(raw or []):
+        if not isinstance(o, dict):
+            continue
+        if "steps" in o or "title" in o or "applies_when" in o:  # 新形状
+            out.append(
+                FixOption(
+                    title=_str(o.get("title")) or f"方案{i + 1}",
+                    applies_when=_str(o.get("applies_when")),
+                    recommended=_as_bool(o.get("recommended")),
+                    reason=_str(o.get("reason")),
+                    steps=_parse_steps(o.get("steps")),
+                )
+            )
+            continue
+        if "target" in o or "action" in o:  # 旧扁平形状 → 包成单方案
+            steps = _parse_steps([o])
+            if steps:
+                out.append(FixOption(title=f"方案{i + 1}", steps=steps))
+    return out
+
+
 def conclusion_from_dict(data: dict[str, Any]) -> DiagnosticConclusion:
     """宽容地把 LLM 输出的 dict 归一到 DiagnosticConclusion。"""
     evidence = []
@@ -106,27 +208,7 @@ def conclusion_from_dict(data: dict[str, Any]) -> DiagnosticConclusion:
                     commit=_opt_str(e.get("commit")),
                 )
             )
-    fix = []
-    for r in data.get("recommended_fix") or []:
-        if not isinstance(r, dict):
-            continue
-        action = _str(r.get("action")) or "code_fix"
-        if action not in _ACTIONS:
-            action = "code_fix"
-        risk = r.get("risk") or "medium"
-        if risk not in _RISK_LEVELS:
-            risk = "medium"
-        fix.append(
-            RemediationStep(
-                action=action,  # type: ignore[arg-type]
-                target=_str(r.get("target")),
-                change=_str(r.get("change")),
-                expected_effect=_str(r.get("expected_effect")),
-                risk=risk,  # type: ignore[arg-type]
-                rollback=_str(r.get("rollback")),
-                suggested_diff=_opt_str(r.get("suggested_diff")),
-            )
-        )
+    fix = _parse_options(data.get("recommended_fix"))
     confidence = data.get("confidence") or "medium"
     if confidence not in _RISK_LEVELS:
         confidence = "medium"

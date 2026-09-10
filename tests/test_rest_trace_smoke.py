@@ -90,3 +90,44 @@ def test_k8s_case_default_back_compat(isolated_store, scripted_model):
         sid = r.json()["session_id"]
         snap = _poll(client, sid)
         assert snap["status"] == "completed", f"error={snap['error']!r}"
+
+
+def test_log_door_full_stack_completes(isolated_store, scripted_model):
+    """日志采集门：只给日志摘录 + 定位键，走同一条 trace_code 后端链路到 completed。"""
+    with TestClient(api_mod.app) as client:
+        r = client.post(
+            "/diagnose/logs",
+            json={
+                "log_excerpt": (
+                    'Cannot invoke "String.trim()" because the return value of '
+                    '"acc.sipaiops.dto.CreateIncidentRequest.getAssignee()" is null'
+                ),
+                "app": "sip-aiops-management",
+                "repo": "sip-aiops-management",
+                "trace_id": "2430a48a7e4d4a4f97b2788ed6a8891b",
+            },
+        )
+        assert r.status_code == 200
+        sid = r.json()["session_id"]
+        snap = _poll(client, sid)
+        assert snap["status"] == "completed", f"error={snap['error']!r}"
+        assert snap["trigger"] == "log"
+
+
+def test_metric_door_full_stack_completes(isolated_store, scripted_model):
+    """指标采集门：告警字段 + 定位键，同样汇入 trace_code 后端到 completed。"""
+    with TestClient(api_mod.app) as client:
+        r = client.post(
+            "/diagnose/metrics",
+            json={
+                "metric": "container_restarts",
+                "resource": "payment-checkout-6f9c8d7b5-xvz2p",
+                "value": "7",
+                "threshold": ">3 in 5m",
+            },
+        )
+        assert r.status_code == 200
+        sid = r.json()["session_id"]
+        snap = _poll(client, sid)
+        assert snap["status"] == "completed", f"error={snap['error']!r}"
+        assert snap["trigger"] == "metric"

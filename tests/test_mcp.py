@@ -93,7 +93,13 @@ def test_seed_rows_real_url_uses_real_server_names_and_auth():
 
 
 def test_seed_rows_mixed_keeps_mock_role_for_unset_url():
-    s = Settings(git_mcp_url="http://127.0.0.1:8100/mcp", git_mcp_token="git-tok")  # app-log 无 url
+    # 显式清空 app-log url/token：否则会被开发者 .env 的真实 url 污染（同 _mock_settings 的理由）
+    s = Settings(
+        git_mcp_url="http://127.0.0.1:8100/mcp",
+        git_mcp_token="git-tok",
+        applog_mcp_url="",
+        applog_mcp_token="",
+    )
     names = {r["name"] for r in build_seed_rows(s)}
     assert "git-search-mcp-server" in names
     assert "app-log" in names  # 未配的 app-log 角色仍走 mock
@@ -178,3 +184,28 @@ def test_manager_build_client_unsupported_transport_raises():
     mgr = MCPClientManager(MCPStore())
     with pytest.raises(ValueError):
         mgr._build_client({**GIT_ROW, "transport": "inproc"})
+
+
+class _StubMCPManager:
+    """resolve 测试用桩：不真连 MCP，只回空 client/allow。"""
+
+    async def clients_for(self, names):  # noqa: ANN001, ARG002
+        return []
+
+    async def allow_names_for(self, names):  # noqa: ANN001, ARG002
+        return []
+
+
+async def test_resolve_specs_trace_code_has_no_local_repo_state(monkeypatch):
+    """HEAD 走 git MCP，不再有本地 repo_state function 工具：trace_code 的 function specs
+    只剩 fetch_strategy（Phase 7 delta）。"""
+    import aidiag.api as api_mod
+    from aidiag.domain import Issue
+
+    monkeypatch.setattr(api_mod.app.state, "mcp", _StubMCPManager(), raising=False)
+    specs, clients, allow = await api_mod._resolve_specs_for(
+        Issue(case_type="trace_code", repo="sip-aiops-management")
+    )
+    assert {s.name for s in specs} == {"fetch_strategy"}
+    assert clients == [] and allow == []
+
