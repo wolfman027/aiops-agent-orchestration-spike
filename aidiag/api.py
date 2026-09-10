@@ -13,6 +13,7 @@ Stage2（计划级审批：approve 是终态签章，**零执行**）：
   recommended 方案），把该方案的 steps 快照为待审批计划。
 - ``POST /approve/{id}``：approve → plan/session 置 approved（无下游动作，不真改代码/环境）；
   reject+feedback → 并入上下文重跑诊断；重跑次数 ≥ max → closed_manual（终态）。
+- ``POST /dismiss/{id}``：忽略/误报 → 会话签为终态 ``dismissed``（不改 conclusion、不重跑、不碰 tasks）。
 """
 
 from __future__ import annotations
@@ -398,6 +399,36 @@ async def approve(session_id: str, req: ApproveRequest) -> dict[str, Any]:
         "max_reanalyze": get_settings().max_reanalyze,
         "note": "approve 为终态签章，不执行任何改动",
     }
+
+
+class DismissRequest(BaseModel):
+    reason: str = ""
+
+
+@app.post("/dismiss/{session_id}")
+async def dismiss(session_id: str, req: DismissRequest | None = None) -> dict[str, Any]:
+    """忽略/误报：把会话签为终态 ``dismissed``（不改 conclusion、不重跑、不碰 tasks）。
+
+    与 ``/approve`` 的 approve 不同——它是"人已判定这条不用做"的**终态归档**：
+    - 只接受已收敛的会话（``completed``/``failed``/``closed_manual``）；``analyzing`` 正在跑 → 409
+      （先 ``/stop``）；已 ``dismissed`` → 409（语义明确，不静默成功）。
+    - **不调 ``finalize_terminal_tasks``**：dismiss 不重跑，``tasks`` 在 ``completed`` 时已归一
+      （或本就是 ``failed`` 的 cancelled），再归一反而会把 cancelled 弄脏。
+    - reason 复用现成的 ``session.feedbacks`` 记录（不为一个字符串新加字段）。
+    """
+    session = STORE.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="session not found or expired")
+    if session.status not in ("completed", "failed", "closed_manual"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"会话处于 {session.status}，不可忽略（仅 completed/failed/closed_manual 可忽略）",
+        )
+    if req and req.reason.strip():
+        session.feedbacks.append(req.reason.strip())
+    session.status = "dismissed"
+    session.touch()
+    return {"session_id": session_id, "status": session.status}
 
 
 @app.get("/health")

@@ -150,7 +150,8 @@ class RemediationPlan(BaseModel):                      # [改] 语义从"执行�
     decided_at: float | None = None
 
 # ExecutionResult / RemediationPlan.executions / status="executed"  [删] 无执行器，全部移除
-# Session 本身基本不动：analyzing|completed|failed + reanalyze_count + feedbacks
+# Session 本身基本不动：analyzing|completed|failed|approved|closed_manual|dismissed
+#   + reanalyze_count + feedbacks（dismissed 见 §3.2，与 approved 并列的终态）
 ```
 
 **必须三件同步改**：`aidiag/domain.py` 模型、`conclusion_from_dict` 宽容解析、`aidiag/prompts/conclusion.j2` 契约文本（让 LLM 知道要输出 base_commit / already_fixed_by / change / suggested_diff）。
@@ -183,6 +184,34 @@ class RemediationPlan(BaseModel):                      # [改] 语义从"执行�
 前端（Problem Center「View diagnosis」）在同一契约上做**显示侧兜底**：终态却仍见
 `todo`/`in_progress`（旧会话/异常路径）时不再印原始枚举，而是按上表派生成
 「随结论完成」/「已中止」；非终态照常显示 待办/进行中/已完成。
+
+### 3.2 终态「忽略」门（`POST /dismiss/{session_id}`）
+
+人裁定「这条不用做」时的**终态归档**门。与 `/approve` 的 approve 并列，但语义相反：
+approve 是"计划我认了"（`approved`），dismiss 是"这条不需要处理"（`dismissed`）。
+**不重跑、不碰 tasks、不改 `conclusion`/`remediation`**——只改 `session.status`。
+
+```
+POST /dismiss/{session_id}   body: {"reason": "<可选，归 APM 记；spike 只存 feedbacks>"}
+  200 → {"session_id": ..., "status": "dismissed"}
+  404 → session 不存在或已过 TTL
+  409 → 会话处于 analyzing（正在跑，先 /stop）/ 已是 dismissed（不静默成功）
+```
+
+- **允许的前置态**：`completed` / `failed` / `closed_manual`（均已收敛、无后台任务在跑）。
+- **不调 `finalize_terminal_tasks`**：`completed` 的 `tasks` 落终态时已归一；`failed` 的 `cancelled`
+  再归一反而会被弄脏。dismiss 不产生新终态语义，故不触发归一。
+- **reason 的分工**：spike 侧只把 reason 追加进现成的 `feedbacks`（不为一个字符串新加字段）；
+  **"忽略 vs 误报"的判定与审计归 APM**（见下），spike 只认"终态 dismissed"这一种结果。
+- **APM 侧的编排**：忽略 → `records.close(reason="ignored")` → 问题单 `state=closed`；
+  误报 → 既有 FPR 回写 + `records.resolve(reason="false_positive")` → `state=resolved`。
+  **404 容忍**（会话已过 TTL 即 404）：忽略/误报不能因会话过期而失败——关单不该被一个内存态卡住。
+  完整决策矩阵与三仓时序见 `DIAGNOSE_APPROVAL_DESIGN.md`。
+- **APM 在决策那一刻先取一份 `/status` 快照做历史留档**（三种决策都取，best-effort，抓不到就降级）。
+  因为**重跑会把整轮现场推平**（`aidiag/diag/runner.py:117-121`：`raw_reply`/`tasks`/`tool_calls`/
+  `conclusion`/`remediation` 全部清空），拒绝之后第一轮的根因/总结/全部方案/分析链路在 spike 侧
+  **不可恢复**——唯一能留住的时点就是"动手之前"。
+  spike 侧无需改动：`/status` 已含所需的全部字段（`tasks`/`tool_calls`/`conclusion`/`remediation_*`）。
 
 ---
 
